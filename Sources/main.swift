@@ -504,6 +504,7 @@ struct EntryCard: View {
 
     @State private var hovering = false
     @State private var loadedImage: NSImage?
+    @Environment(\.colorScheme) var colorScheme
 
     var body: some View {
         Button(action: onCopy) {
@@ -541,7 +542,7 @@ struct EntryCard: View {
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             .overlay {
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                                    .stroke(colorScheme == .dark ? Color.white.opacity(0.15) : Color.black.opacity(0.08), lineWidth: 1)
                             }
                     } else {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -606,7 +607,7 @@ struct EntryCard: View {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [Color.white.opacity(0.95), Color.gray.opacity(0.08)],
+                            colors: colorScheme == .dark ? [Color.white.opacity(0.08), Color.white.opacity(0.02)] : [Color.white.opacity(0.95), Color.gray.opacity(0.08)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
@@ -614,7 +615,7 @@ struct EntryCard: View {
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(hovering ? Color.blue.opacity(0.25) : Color.black.opacity(0.07), lineWidth: 1)
+                    .stroke(colorScheme == .dark ? (hovering ? Color.blue.opacity(0.4) : Color.white.opacity(0.1)) : (hovering ? Color.blue.opacity(0.25) : Color.black.opacity(0.07)), lineWidth: 1)
             }
             .shadow(color: .black.opacity(hovering ? 0.12 : 0.05), radius: hovering ? 12 : 6, y: 3)
             .animation(.easeOut(duration: 0.18), value: hovering)
@@ -818,6 +819,7 @@ struct ContentView: View {
     @ObservedObject var loginManager: LaunchAtLoginManager
 
     @State private var toastText: String?
+    @Environment(\.colorScheme) var colorScheme
 
     var body: some View {
         NavigationSplitView {
@@ -826,7 +828,7 @@ struct ContentView: View {
         } detail: {
             ZStack(alignment: .topTrailing) {
                 LinearGradient(
-                    colors: [Color(red: 0.95, green: 0.97, blue: 1.0), Color.white],
+                    colors: colorScheme == .dark ? [Color(red: 0.1, green: 0.11, blue: 0.15), Color(red: 0.07, green: 0.08, blue: 0.1)] : [Color(red: 0.95, green: 0.97, blue: 1.0), Color.white],
                     startPoint: .top,
                     endPoint: .bottom
                 )
