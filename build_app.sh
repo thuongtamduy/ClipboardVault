@@ -42,4 +42,8 @@ cat > ClipboardVault.app/Contents/Info.plist <<EOF
 </plist>
 EOF
 
+# Ad-hoc code sign the bundle. SMAppService (Launch at Login) on macOS 14+
+# refuses to register unsigned bundles with "Operation not permitted".
+codesign --force --deep --sign - ClipboardVault.app
+
 echo "Build successful: ClipboardVault.app created with icon!"
