@@ -1,14 +1,15 @@
 #!/bin/bash
+set -e
 
-# Build the debug binary
-swift build
+# Build the release binary (optimized, no DEBUG-only code paths)
+swift build -c release
 
 # Create the app bundle directory structure
 mkdir -p ClipboardVault.app/Contents/MacOS
 mkdir -p ClipboardVault.app/Contents/Resources
 
 # Copy the binary
-cp .build/debug/ClipboardVault ClipboardVault.app/Contents/MacOS/
+cp .build/release/ClipboardVault ClipboardVault.app/Contents/MacOS/
 
 # Copy the icon
 if [ -f app_icon.icns ]; then

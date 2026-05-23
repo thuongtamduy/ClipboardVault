@@ -12,31 +12,30 @@ enum ClipboardKind: Equatable {
 }
 
 struct ClipboardEntry: Identifiable, Equatable {
+    enum SmartType: Equatable {
+        case url(URL)
+        case color(Color)
+        case none
+    }
+
     let id: UUID
     let createdAt: Date
     let kind: ClipboardKind
     var isFavorite: Bool
+    let smartType: SmartType
 
     init(id: UUID = UUID(), createdAt: Date = Date(), kind: ClipboardKind, isFavorite: Bool = false) {
         self.id = id
         self.createdAt = createdAt
         self.kind = kind
         self.isFavorite = isFavorite
+        self.smartType = Self.detectSmartType(kind: kind)
     }
-}
 
-extension ClipboardEntry {
-    enum SmartType {
-        case url(URL)
-        case color(Color)
-        case none
-    }
-    
-    var smartType: SmartType {
+    private static func detectSmartType(kind: ClipboardKind) -> SmartType {
         guard case .text(let text) = kind else { return .none }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Color check
+
         if trimmed.hasPrefix("#") {
             let hex = trimmed.dropFirst()
             if hex.count == 6 {
@@ -50,12 +49,11 @@ extension ClipboardEntry {
                 }
             }
         }
-        
-        // URL check
+
         if let url = URL(string: trimmed), url.scheme != nil {
             return .url(url)
         }
-        
+
         return .none
     }
 }
@@ -227,10 +225,16 @@ final class ClipboardPersistence {
         let dir = appSupport.appendingPathComponent("ClipboardVault", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("clipboard.sqlite").path
-        if sqlite3_open(path, &db) != SQLITE_OK {
+        // FULLMUTEX serializes all calls on this connection so it is safe to use
+        // from both the @MainActor store (writes) and the EntryCard background
+        // Task that lazily loads image BLOBs.
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             print("Failed to open database at: \(path)")
         } else {
+            #if DEBUG
             print("Database opened successfully at: \(path)")
+            #endif
             // Enable WAL mode for better concurrency
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
         }
@@ -255,6 +259,35 @@ final class ClipboardPersistence {
         // Try to add columns if they don't exist (for existing databases)
         sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_width REAL;", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_height REAL;", nil, nil, nil)
+    }
+}
+
+final class ImageCache {
+    private let cache = NSCache<NSUUID, NSImage>()
+    private let persistence: ClipboardPersistence
+
+    init(persistence: ClipboardPersistence) {
+        self.persistence = persistence
+        cache.countLimit = 60
+    }
+
+    func image(for id: UUID) -> NSImage? {
+        let key = id as NSUUID
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+        guard let data = persistence.loadImageData(id: id),
+              let image = NSImage(data: data) else { return nil }
+        cache.setObject(image, forKey: key)
+        return image
+    }
+
+    func invalidate(id: UUID) {
+        cache.removeObject(forKey: id as NSUUID)
+    }
+
+    func invalidateAll() {
+        cache.removeAllObjects()
     }
 }
 
@@ -294,10 +327,17 @@ final class ClipboardStore: ObservableObject {
     private var lastChangeCount: Int = 0
     private var lastSignature: String = ""
     private let maxEntries = 200
+    private let pollInterval: TimeInterval = 1.0
     let persistence = ClipboardPersistence()
+    let imageCache: ImageCache
 
     init() {
-        entries = persistence.loadEntries()
+        let p = persistence
+        self.imageCache = ImageCache(persistence: p)
+        // One-shot trim in case a previous app version stored more than the
+        // current cap; keeps the in-memory and on-disk views consistent.
+        p.trimToMax(maxEntries)
+        entries = p.loadEntries()
         startMonitoring()
     }
 
@@ -343,7 +383,7 @@ final class ClipboardStore: ObservableObject {
 
     func startMonitoring() {
         lastChangeCount = pasteboard.changeCount
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.checkClipboard()
             }
@@ -361,8 +401,7 @@ final class ClipboardStore: ObservableObject {
         case .text(let value):
             pasteboard.setString(value, forType: .string)
         case .image(let id, _, _):
-            if let data = persistence.loadImageData(id: id),
-               let image = NSImage(data: data) {
+            if let image = imageCache.image(for: id) {
                 pasteboard.writeObjects([image])
             }
         }
@@ -371,11 +410,15 @@ final class ClipboardStore: ObservableObject {
     func clearAll() {
         entries.removeAll()
         persistence.clearAll()
+        imageCache.invalidateAll()
     }
 
     func remove(_ entry: ClipboardEntry) {
         entries.removeAll { $0.id == entry.id }
         persistence.delete(id: entry.id)
+        if case .image = entry.kind {
+            imageCache.invalidate(id: entry.id)
+        }
     }
 
     func toggleFavorite(_ entry: ClipboardEntry) {
@@ -400,12 +443,24 @@ final class ClipboardStore: ObservableObject {
 
         if let tiffData = pasteboard.data(forType: .tiff),
            let image = NSImage(data: tiffData) {
-            let signature = "image:\(tiffData.hashValue)"
+            // PNG is ~5-10× smaller than raw TIFF for typical screenshots; fall
+            // back to TIFF only if PNG encoding fails for some reason.
+            let storedData: Data = {
+                guard let bitmap = NSBitmapImageRep(data: tiffData),
+                      let png = bitmap.representation(using: .png, properties: [:]) else {
+                    return tiffData
+                }
+                return png
+            }()
+            // Use byte count + a small stable prefix slice for the signature so
+            // identical images dedup reliably within a session.
+            let prefix = storedData.prefix(64)
+            let signature = "image:\(storedData.count):\(prefix.hashValue)"
             guard signature != lastSignature else { return }
             lastSignature = signature
-            
+
             let id = UUID()
-            insert(.image(id: id, width: image.size.width, height: image.size.height), imageData: tiffData)
+            insert(.image(id: id, width: image.size.width, height: image.size.height), imageData: storedData)
         }
     }
 
@@ -423,8 +478,8 @@ final class ClipboardStore: ObservableObject {
 
         if entries.count > maxEntries {
             entries = Array(entries.prefix(maxEntries))
+            persistence.trimToMax(maxEntries)
         }
-        persistence.trimToMax(maxEntries)
     }
 }
 
@@ -453,7 +508,9 @@ final class GlobalHotKeyManager {
             GetEventParameter(eventRef, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
 
             if hkID.id == 1 {
+                #if DEBUG
                 print("Hotkey Cmd+Shift+V triggered!")
+                #endif
                 DispatchQueue.main.async {
                     manager.activationHandler?()
                 }
@@ -553,13 +610,8 @@ struct EntryCard: View {
                                     .scaleEffect(0.5)
                             }
                             .onAppear {
-                                Task {
-                                    if let data = store.persistence.loadImageData(id: id) {
-                                        let img = NSImage(data: data)
-                                        await MainActor.run {
-                                            loadedImage = img
-                                        }
-                                    }
+                                if loadedImage == nil {
+                                    loadedImage = store.imageCache.image(for: id)
                                 }
                             }
                     }
@@ -881,14 +933,11 @@ struct ClipboardVaultApp: App {
                 .onAppear {
                     NSApplication.shared.setActivationPolicy(.accessory)
                     GlobalHotKeyManager.shared.register {
-                        print("Activation handler called!")
                         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
                         if let window = NSApplication.shared.windows.first(where: { $0.title == "ClipboardVault" }) {
-                            print("Window found, bringing to front.")
                             window.makeKeyAndOrderFront(nil)
                             NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
                         } else {
-                            print("No window found! Opening window.")
                             openWindow(id: "main")
                             NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
                         }
