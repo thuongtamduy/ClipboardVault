@@ -3,6 +3,14 @@ import AppKit
 import Carbon.HIToolbox
 import SQLite3
 import ServiceManagement
+import OSLog
+
+private enum Log {
+    static let subsystem = "com.thuongtamduy.ClipboardVault"
+    static let db       = Logger(subsystem: subsystem, category: "db")
+    static let hotkey   = Logger(subsystem: subsystem, category: "hotkey")
+    static let installer = Logger(subsystem: subsystem, category: "installer")
+}
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -78,10 +86,14 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
 
 final class ClipboardPersistence {
     private var db: OpaquePointer?
+    private let explicitPath: String?
 
-    init() {
+    /// `path` is for tests; production callers use the default which lives in
+    /// Application Support.
+    init(path: String? = nil) {
+        self.explicitPath = path
         openDatabase()
-        createTableIfNeeded()
+        runMigrations()
     }
 
     deinit {
@@ -161,7 +173,7 @@ final class ClipboardPersistence {
         let result = sqlite3_step(stmt)
         if result != SQLITE_DONE {
             let errorMsg = String(cString: sqlite3_errmsg(db))
-            print("Failed to upsert entry! Error: \(errorMsg)")
+            Log.db.error("Upsert failed: \(errorMsg, privacy: .public)")
         }
     }
 
@@ -220,45 +232,73 @@ final class ClipboardPersistence {
     }
 
     private func openDatabase() {
-        let fm = FileManager.default
-        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
-        let dir = appSupport.appendingPathComponent("ClipboardVault", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("clipboard.sqlite").path
+        let path: String
+        if let explicitPath {
+            path = explicitPath
+        } else {
+            let fm = FileManager.default
+            guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+            let dir = appSupport.appendingPathComponent("ClipboardVault", isDirectory: true)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            path = dir.appendingPathComponent("clipboard.sqlite").path
+        }
         // FULLMUTEX serializes all calls on this connection so it is safe to use
         // from both the @MainActor store (writes) and the EntryCard background
         // Task that lazily loads image BLOBs.
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
-            print("Failed to open database at: \(path)")
+            Log.db.error("Failed to open database at: \(path, privacy: .public)")
         } else {
-            #if DEBUG
-            print("Database opened successfully at: \(path)")
-            #endif
+            Log.db.debug("Database opened at: \(path, privacy: .public)")
             // Enable WAL mode for better concurrency
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
         }
     }
 
-    private func createTableIfNeeded() {
+    private func runMigrations() {
         guard let db else { return }
-        let sql = """
-        CREATE TABLE IF NOT EXISTS clipboard_entries (
-            id TEXT PRIMARY KEY,
-            created_at REAL NOT NULL,
-            kind TEXT NOT NULL,
-            text_value TEXT,
-            image_data BLOB,
-            image_width REAL,
-            image_height REAL,
-            is_favorite INTEGER NOT NULL DEFAULT 0
-        );
-        """
-        sqlite3_exec(db, sql, nil, nil, nil)
-        
-        // Try to add columns if they don't exist (for existing databases)
-        sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_width REAL;", nil, nil, nil)
-        sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_height REAL;", nil, nil, nil)
+        let current = readUserVersion()
+
+        if current < 1 {
+            // Baseline schema. Idempotent: CREATE … IF NOT EXISTS handles fresh
+            // installs; the two ALTERs below cover users upgrading from an even
+            // older build that pre-dated image_width/image_height.
+            sqlite3_exec(db, """
+            CREATE TABLE IF NOT EXISTS clipboard_entries (
+                id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                kind TEXT NOT NULL,
+                text_value TEXT,
+                image_data BLOB,
+                image_width REAL,
+                image_height REAL,
+                is_favorite INTEGER NOT NULL DEFAULT 0
+            );
+            """, nil, nil, nil)
+            sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_width REAL;", nil, nil, nil)
+            sqlite3_exec(db, "ALTER TABLE clipboard_entries ADD COLUMN image_height REAL;", nil, nil, nil)
+            writeUserVersion(1)
+        }
+
+        // Future migrations append here as: if current < 2 { … writeUserVersion(2) }
+    }
+
+    private func readUserVersion() -> Int {
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int(stmt, 0))
+        }
+        return 0
+    }
+
+    private func writeUserVersion(_ version: Int) {
+        guard let db else { return }
+        // PRAGMA does not accept bound parameters, but version is internal so
+        // string interpolation is safe here.
+        sqlite3_exec(db, "PRAGMA user_version = \(version);", nil, nil, nil)
     }
 }
 
@@ -268,9 +308,14 @@ final class ImageCache {
 
     init(persistence: ClipboardPersistence) {
         self.persistence = persistence
-        cache.countLimit = 60
+        // Hold up to the full default history so scroll-back doesn't re-decode;
+        // bounded by ~100MB total so a few huge screenshots can't blow memory.
+        cache.countLimit = 200
+        cache.totalCostLimit = 100 * 1024 * 1024
     }
 
+    /// Synchronous: returns the cached image if present, otherwise reads it
+    /// from SQLite, decodes, and caches.
     func image(for id: UUID) -> NSImage? {
         let key = id as NSUUID
         if let cached = cache.object(forKey: key) {
@@ -278,8 +323,18 @@ final class ImageCache {
         }
         guard let data = persistence.loadImageData(id: id),
               let image = NSImage(data: data) else { return nil }
-        cache.setObject(image, forKey: key)
+        // PNG byte count is a reasonable proxy for the decoded image's memory
+        // footprint (decoded bitmap is larger, but the relative cost ordering
+        // is what matters for NSCache eviction).
+        cache.setObject(image, forKey: key, cost: data.count)
         return image
+    }
+
+    /// Non-loading peek — returns nil on miss instead of hitting the DB. Used
+    /// by EntryCard at init time to avoid a one-frame ProgressView flash for
+    /// images that are already in memory.
+    func cachedImage(for id: UUID) -> NSImage? {
+        cache.object(forKey: id as NSUUID)
     }
 
     func invalidate(id: UUID) {
@@ -326,8 +381,17 @@ final class ClipboardStore: ObservableObject {
     private var timer: Timer?
     private var lastChangeCount: Int = 0
     private var lastSignature: String = ""
-    private let maxEntries = 200
-    private let pollInterval: TimeInterval = 1.0
+    static let defaultMaxEntries = 200
+    static let defaultPollInterval: TimeInterval = 1.0
+
+    private var maxEntries: Int {
+        let stored = UserDefaults.standard.integer(forKey: "maxEntries")
+        return stored > 0 ? stored : Self.defaultMaxEntries
+    }
+    private var pollInterval: TimeInterval {
+        let stored = UserDefaults.standard.double(forKey: "pollInterval")
+        return stored > 0 ? stored : Self.defaultPollInterval
+    }
     let persistence = ClipboardPersistence()
     let imageCache: ImageCache
 
@@ -362,16 +426,16 @@ final class ClipboardStore: ObservableObject {
             }
         }
 
-        guard !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return byType
-        }
-        let key = searchText.lowercased()
+        let key = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return byType }
+        // range(of:options:) defers to CFString comparison: no per-entry
+        // String allocation, unlike `lhs.lowercased().contains(rhs.lowercased())`.
         return byType.filter { entry in
             switch entry.kind {
             case .text(let text):
-                return text.lowercased().contains(key)
+                return text.range(of: key, options: .caseInsensitive) != nil
             case .image:
-                return "image photo screenshot".contains(key)
+                return "image photo screenshot".range(of: key, options: .caseInsensitive) != nil
             }
         }
     }
@@ -383,11 +447,16 @@ final class ClipboardStore: ObservableObject {
 
     func startMonitoring() {
         lastChangeCount = pasteboard.changeCount
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+        // Schedule on .common so the timer keeps firing during scroll/menu
+        // tracking — otherwise we miss clipboard changes for as long as the
+        // user holds a scroll gesture anywhere on the system.
+        let t = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.checkClipboard()
             }
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func stopMonitoring() {
@@ -395,16 +464,30 @@ final class ClipboardStore: ObservableObject {
         timer = nil
     }
 
-    func copyBack(_ entry: ClipboardEntry) {
-        pasteboard.clearContents()
+    /// Returns true if something was actually written to the pasteboard.
+    @discardableResult
+    func copyBack(_ entry: ClipboardEntry) -> Bool {
         switch entry.kind {
         case .text(let value):
+            pasteboard.clearContents()
             pasteboard.setString(value, forType: .string)
+            // Pre-match the signature so that if the user then externally
+            // re-copies the same text within the polling window we still dedup.
+            lastSignature = "text:\(value)"
         case .image(let id, _, _):
-            if let image = imageCache.image(for: id) {
-                pasteboard.writeObjects([image])
+            guard let image = imageCache.image(for: id) else {
+                // BLOB missing / corrupt — don't clobber whatever the user
+                // had on the clipboard before.
+                Log.db.error("copyBack: image data missing for entry \(id.uuidString, privacy: .public)")
+                return false
             }
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
         }
+        // Our own write bumped changeCount; absorb it so the next poll doesn't
+        // treat it as a fresh external copy and re-insert a duplicate entry.
+        lastChangeCount = pasteboard.changeCount
+        return true
     }
 
     func clearAll() {
@@ -427,9 +510,26 @@ final class ClipboardStore: ObservableObject {
         persistence.updateFavorite(id: entries[idx].id, isFavorite: entries[idx].isFavorite)
     }
 
+    // Sentinel UTIs / private types declared by sources we should not record.
+    // Standard for password managers / OTP apps; see nspasteboard.org.
+    private static let sensitivePasteboardTypes: [NSPasteboard.PasteboardType] = [
+        NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),
+        NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
+        NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType"),
+        NSPasteboard.PasteboardType("com.agilebits.onepassword"),
+    ]
+
     private func checkClipboard() {
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
+
+        // Drop anything tagged as a secret / one-shot value before we touch
+        // string() or data() — we bumped lastChangeCount above so we won't
+        // re-test the same pasteboard generation.
+        let types = pasteboard.types ?? []
+        if Self.sensitivePasteboardTypes.contains(where: { types.contains($0) }) {
+            return
+        }
 
         if let text = pasteboard.string(forType: .string) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -508,9 +608,7 @@ final class GlobalHotKeyManager {
             GetEventParameter(eventRef, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
 
             if hkID.id == 1 {
-                #if DEBUG
-                print("Hotkey Cmd+Shift+V triggered!")
-                #endif
+                Log.hotkey.debug("Cmd+Shift+V triggered")
                 DispatchQueue.main.async {
                     manager.activationHandler?()
                 }
@@ -524,37 +622,20 @@ final class GlobalHotKeyManager {
 
 struct SidebarView: View {
     @ObservedObject var store: ClipboardStore
-    @ObservedObject var loginManager: LaunchAtLoginManager
 
     var body: some View {
-        VStack(spacing: 10) {
-            Toggle("Launch at Login", isOn: Binding(
-                get: { loginManager.enabled },
-                set: { loginManager.setEnabled($0) }
-            ))
-            .toggleStyle(.switch)
-
-            if let error = loginManager.lastError {
-                Text(error)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-
-            List(SidebarFilter.allCases, selection: $store.selectedFilter) { filter in
-                Label(filter.rawValue, systemImage: filter.icon)
-                    .tag(filter)
-            }
-            .listStyle(.sidebar)
+        List(SidebarFilter.allCases, selection: $store.selectedFilter) { filter in
+            Label(filter.rawValue, systemImage: filter.icon)
+                .tag(filter)
         }
-        .padding(.horizontal, 8)
-        .padding(.top, 10)
+        .listStyle(.sidebar)
     }
 }
 
 struct EntryCard: View {
     @ObservedObject var store: ClipboardStore
     let entry: ClipboardEntry
+    let isSelected: Bool
     let onCopy: () -> Void
     let onDelete: () -> Void
     let onToggleFavorite: () -> Void
@@ -562,6 +643,26 @@ struct EntryCard: View {
     @State private var hovering = false
     @State private var loadedImage: NSImage?
     @Environment(\.colorScheme) var colorScheme
+
+    init(store: ClipboardStore,
+         entry: ClipboardEntry,
+         isSelected: Bool,
+         onCopy: @escaping () -> Void,
+         onDelete: @escaping () -> Void,
+         onToggleFavorite: @escaping () -> Void) {
+        self.store = store
+        self.entry = entry
+        self.isSelected = isSelected
+        self.onCopy = onCopy
+        self.onDelete = onDelete
+        self.onToggleFavorite = onToggleFavorite
+        // Pre-seed loadedImage from the in-memory cache so a card scrolling
+        // back into view paints the image on its first frame; cache misses
+        // still fall through to the .onAppear loader below.
+        if case .image(let id, _, _) = entry.kind {
+            _loadedImage = State(initialValue: store.imageCache.cachedImage(for: id))
+        }
+    }
 
     var body: some View {
         Button(action: onCopy) {
@@ -666,14 +767,93 @@ struct EntryCard: View {
                     )
             )
             .overlay {
+                let highlighted = hovering || isSelected
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(colorScheme == .dark ? (hovering ? Color.blue.opacity(0.4) : Color.white.opacity(0.1)) : (hovering ? Color.blue.opacity(0.25) : Color.black.opacity(0.07)), lineWidth: 1)
+                    .stroke(
+                        isSelected ? Color.accentColor :
+                            (colorScheme == .dark
+                                ? (highlighted ? Color.blue.opacity(0.4) : Color.white.opacity(0.1))
+                                : (highlighted ? Color.blue.opacity(0.25) : Color.black.opacity(0.07))),
+                        lineWidth: isSelected ? 2 : 1
+                    )
             }
             .shadow(color: .black.opacity(hovering ? 0.12 : 0.05), radius: hovering ? 12 : 6, y: 3)
             .animation(.easeOut(duration: 0.18), value: hovering)
+            .animation(.easeOut(duration: 0.15), value: isSelected)
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+@MainActor
+final class AutoPaster {
+    static let shared = AutoPaster()
+    private(set) var previousApp: NSRunningApplication?
+
+    /// Must be called BEFORE ClipboardVault activates itself so frontmostApplication
+    /// still points to the user's editor / browser / etc.
+    func capturePreviousApp() {
+        let me = NSRunningApplication.current
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.processIdentifier != me.processIdentifier {
+            previousApp = front
+        }
+    }
+
+    func pasteToPreviousApp() {
+        guard AXIsProcessTrusted() else { return }
+        guard let prev = previousApp else { return }
+        // Consume the capture so a later menubar-driven selection (no fresh
+        // capturePreviousApp call) doesn't auto-paste into the stale app.
+        previousApp = nil
+        prev.activate()
+        // Small delay so the OS finishes the activation hand-off before we
+        // synthesise the keystroke.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            Self.sendCmdV()
+        }
+    }
+
+    /// Pops the standard macOS "grant Accessibility" dialog if the user has
+    /// not yet authorised us. Safe to call repeatedly; the dialog only shows
+    /// when permission is missing.
+    @discardableResult
+    static func ensureAccessibility() -> Bool {
+        // Hard-coded value of kAXTrustedCheckOptionPrompt; the imported global
+        // is `var` and trips Swift 6's concurrency-safety check.
+        return AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+    }
+
+    private static func sendCmdV() {
+        let src = CGEventSource(stateID: .combinedSessionState)
+        let vKey: CGKeyCode = 0x09 // 'v'
+        let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true)
+        let up = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false)
+        down?.flags = .maskCommand
+        up?.flags = .maskCommand
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+    }
+}
+
+@MainActor
+enum WindowController {
+    static let mainWindowTitle = "ClipboardVault"
+
+    static func mainWindow() -> NSWindow? {
+        NSApplication.shared.windows.first(where: { $0.title == mainWindowTitle })
+    }
+
+    static func hideMainWindow() {
+        mainWindow()?.orderOut(nil)
+    }
+
+    static func showMainWindow() {
+        if let window = mainWindow() {
+            window.makeKeyAndOrderFront(nil)
+        }
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
     }
 }
 
@@ -708,7 +888,7 @@ struct AppInstaller {
             let config = NSWorkspace.OpenConfiguration()
             NSWorkspace.shared.openApplication(at: destinationURL, configuration: config) { _, error in
                 if let error {
-                    print("Failed to launch moved app: \(error.localizedDescription)")
+                    Log.installer.error("Failed to launch moved app: \(error.localizedDescription, privacy: .public)")
                 } else {
                     DispatchQueue.main.async {
                         NSApplication.shared.terminate(nil)
@@ -716,7 +896,7 @@ struct AppInstaller {
                 }
             }
         } catch {
-            print("Failed to move app to Applications: \(error.localizedDescription)")
+            Log.installer.error("Failed to move app to Applications: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
@@ -724,6 +904,24 @@ struct AppInstaller {
 struct MainPanelView: View {
     @ObservedObject var store: ClipboardStore
     @Binding var toastText: String?
+
+    @State private var selectedIndex: Int = 0
+    @State private var keyMonitor: Any?
+    @State private var toastTask: Task<Void, Never>?
+    @FocusState private var searchFocused: Bool
+    @AppStorage("autoPasteEnabled") private var autoPasteEnabled: Bool = false
+
+    private func selectAndPaste(_ entry: ClipboardEntry) {
+        guard store.copyBack(entry) else {
+            showToast("Couldn't load that image")
+            return
+        }
+        showToast("Copied to clipboard")
+        WindowController.hideMainWindow()
+        if autoPasteEnabled {
+            AutoPaster.shared.pasteToPreviousApp()
+        }
+    }
 
     var body: some View {
         VStack(spacing: 14) {
@@ -752,43 +950,138 @@ struct MainPanelView: View {
             HStack {
                 TextField("Search text...", text: $store.searchText)
                     .textFieldStyle(.roundedBorder)
+                    .focused($searchFocused)
                 Button("Clear All") {
                     store.clearAll()
                 }
                 .keyboardShortcut(.delete, modifiers: [.command, .shift])
             }
 
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    ForEach(store.filteredEntries) { entry in
-                        EntryCard(
-                            store: store,
-                            entry: entry,
-                            onCopy: {
-                                store.copyBack(entry)
-                                showToast("Copied to clipboard")
-                            },
-                            onDelete: {
-                                store.remove(entry)
-                            },
-                            onToggleFavorite: {
-                                store.toggleFavorite(entry)
-                            }
-                        )
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(Array(store.filteredEntries.enumerated()), id: \.element.id) { idx, entry in
+                            EntryCard(
+                                store: store,
+                                entry: entry,
+                                isSelected: idx == selectedIndex,
+                                onCopy: {
+                                    selectAndPaste(entry)
+                                },
+                                onDelete: {
+                                    store.remove(entry)
+                                },
+                                onToggleFavorite: {
+                                    store.toggleFavorite(entry)
+                                }
+                            )
+                            .id(entry.id)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .onChange(of: selectedIndex) { newIndex in
+                    let entries = store.filteredEntries
+                    guard entries.indices.contains(newIndex) else { return }
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        proxy.scrollTo(entries[newIndex].id, anchor: .center)
                     }
                 }
-                .padding(.vertical, 4)
             }
         }
         .padding(18)
+        .onAppear {
+            installKeyMonitor()
+        }
+        .onDisappear {
+            removeKeyMonitor()
+        }
+        .onChange(of: store.searchText) { _ in selectedIndex = 0 }
+        .onChange(of: store.selectedFilter) { _ in selectedIndex = 0 }
+    }
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // The local monitor fires for every window owned by our process
+            // (including Settings). Without this guard, pressing Enter inside
+            // a Settings text field would trigger paste-back, and Esc would
+            // close the main window — neither makes sense from Settings.
+            guard event.window === WindowController.mainWindow() else {
+                return event
+            }
+            return self.handleKey(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let m = keyMonitor {
+            NSEvent.removeMonitor(m)
+            keyMonitor = nil
+        }
+    }
+
+    /// Returns true if the event was consumed.
+    private func handleKey(_ event: NSEvent) -> Bool {
+        let entries = store.filteredEntries
+
+        // Escape always closes window — works even from inside search field.
+        if event.keyCode == 53 {
+            WindowController.hideMainWindow()
+            return true
+        }
+
+        // While typing in search box, only swallow nav keys; let characters through.
+        let searchHasFocus = searchFocused
+        let isNav = [125, 126, 36, 76].contains(event.keyCode) // ↓ ↑ Return KeypadEnter
+
+        // Cmd+1..4 is reserved for filter switching (toolbar bindings); ignore
+        // here so SwiftUI's toolbar shortcut wins.
+        if event.modifierFlags.contains(.command) { return false }
+
+        if searchHasFocus && !isNav { return false }
+
+        switch event.keyCode {
+        case 125: // down
+            if !entries.isEmpty {
+                selectedIndex = min(selectedIndex + 1, entries.count - 1)
+            }
+            return true
+        case 126: // up
+            selectedIndex = max(0, selectedIndex - 1)
+            return true
+        case 36, 76: // return / keypad enter
+            if entries.indices.contains(selectedIndex) {
+                selectAndPaste(entries[selectedIndex])
+            }
+            return true
+        default:
+            // Any other printable char while NOT focused on search → focus the
+            // search field and forward the keystroke (type-to-search). Use
+            // Character-level Unicode classification so Vietnamese diacritics
+            // ("đ", "ă", "ư"…) and other non-ASCII letters work too.
+            if !searchHasFocus,
+               let chars = event.characters,
+               !chars.isEmpty,
+               chars.allSatisfy({ $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isSymbol || $0 == " " }) {
+                searchFocused = true
+                store.searchText.append(chars)
+                return true
+            }
+            return false
+        }
     }
 
     private func showToast(_ message: String) {
+        // Cancel any in-flight dismiss task so it can't clear a toast that
+        // belongs to a later showToast call.
+        toastTask?.cancel()
         withAnimation {
             toastText = message
         }
-        Task {
+        toastTask = Task {
             try? await Task.sleep(for: .seconds(1.2))
+            if Task.isCancelled { return }
             await MainActor.run {
                 withAnimation {
                     toastText = nil
@@ -817,13 +1110,10 @@ struct QuickPanelView: View {
                 .buttonStyle(.plain)
                 
                 Button(action: {
-                    if let window = NSApplication.shared.windows.first(where: { $0.title == "ClipboardVault" }) {
-                        window.makeKeyAndOrderFront(nil)
-                        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-                    } else {
+                    if WindowController.mainWindow() == nil {
                         openWindow(id: "main")
-                        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
                     }
+                    WindowController.showMainWindow()
                 }) {
                     Image(systemName: "arrow.up.forward.app")
                 }
@@ -868,14 +1158,13 @@ struct QuickPanelView: View {
 
 struct ContentView: View {
     @ObservedObject var store: ClipboardStore
-    @ObservedObject var loginManager: LaunchAtLoginManager
 
     @State private var toastText: String?
     @Environment(\.colorScheme) var colorScheme
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(store: store, loginManager: loginManager)
+            SidebarView(store: store)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } detail: {
             ZStack(alignment: .topTrailing) {
@@ -921,29 +1210,134 @@ struct ContentView: View {
     }
 }
 
+struct SettingsView: View {
+    @StateObject private var loginManager = LaunchAtLoginManager()
+    @AppStorage("autoPasteEnabled") private var autoPasteEnabled: Bool = false
+    @AppStorage("maxEntries") private var maxEntries: Int = ClipboardStore.defaultMaxEntries
+    @AppStorage("pollInterval") private var pollInterval: Double = ClipboardStore.defaultPollInterval
+
+    var body: some View {
+        TabView {
+            generalTab
+                .tabItem { Label("General", systemImage: "gear") }
+            storageTab
+                .tabItem { Label("Storage", systemImage: "internaldrive") }
+            aboutTab
+                .tabItem { Label("About", systemImage: "info.circle") }
+        }
+        .frame(width: 460, height: 320)
+    }
+
+    private var generalTab: some View {
+        Form {
+            Section("Startup") {
+                Toggle("Launch at Login", isOn: Binding(
+                    get: { loginManager.enabled },
+                    set: { loginManager.setEnabled($0) }
+                ))
+                if let error = loginManager.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Section("Paste behaviour") {
+                Toggle("Auto-paste into previous app after selecting an entry",
+                       isOn: $autoPasteEnabled)
+                if autoPasteEnabled {
+                    Button("Grant Accessibility permission…") {
+                        AutoPaster.ensureAccessibility()
+                    }
+                    Text("Auto-paste needs Accessibility access in System Settings → Privacy & Security.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Privacy") {
+                Text("Items copied from password managers and other apps that mark the clipboard as concealed or transient are automatically skipped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var storageTab: some View {
+        Form {
+            Section("History size") {
+                Stepper("Maximum entries: \(maxEntries)", value: $maxEntries, in: 50...2000, step: 50)
+            }
+            Section("Capture") {
+                VStack(alignment: .leading) {
+                    Text("Polling interval: \(String(format: "%.1f", pollInterval))s")
+                    Slider(value: $pollInterval, in: 0.3...5.0, step: 0.1)
+                }
+                Text("Lower = clipboard changes detected sooner; higher = less CPU. Takes effect after restart.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var aboutTab: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.on.clipboard.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.blue)
+            Text("ClipboardVault").font(.title2.bold())
+            Text("Global hotkey: ⌘⇧V")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Filter shortcuts: ⌘1–4")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Navigate: ↑/↓ • Enter to paste • Esc to hide")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+}
+
 @main
 struct ClipboardVaultApp: App {
     @StateObject private var store = ClipboardStore()
-    @StateObject private var loginManager = LaunchAtLoginManager()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         WindowGroup("ClipboardVault", id: "main") {
-            ContentView(store: store, loginManager: loginManager)
+            ContentView(store: store)
                 .onAppear {
                     NSApplication.shared.setActivationPolicy(.accessory)
                     GlobalHotKeyManager.shared.register {
-                        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-                        if let window = NSApplication.shared.windows.first(where: { $0.title == "ClipboardVault" }) {
-                            window.makeKeyAndOrderFront(nil)
-                            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-                        } else {
+                        // Capture the user's app BEFORE we steal focus so we
+                        // can auto-paste back into it later.
+                        AutoPaster.shared.capturePreviousApp()
+                        if WindowController.mainWindow() == nil {
                             openWindow(id: "main")
-                            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+                        }
+                        WindowController.showMainWindow()
+                    }
+                    // When launched from /Applications the user has already
+                    // onboarded, so don't pop the main window — they expect a
+                    // silent menubar app. Outside /Applications we keep the
+                    // window visible so the "Move to Applications" banner is
+                    // discoverable.
+                    if AppInstaller.isBundle() && AppInstaller.isRunningFromApplications() {
+                        DispatchQueue.main.async {
+                            WindowController.hideMainWindow()
                         }
                     }
                 }
 
+        }
+
+        Settings {
+            SettingsView()
         }
 
         MenuBarExtra("ClipboardVault", systemImage: "clipboard") {
